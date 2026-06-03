@@ -1,7 +1,11 @@
-# ── Database (Windows-only binary, not for version control) ──────────────────
+# ── Access database (Windows-only binary, not for version control) ───────────
 *.accdb
 *.mdb
 *.laccdb
+
+# ── SQLite database — fisheries.db IS tracked (needed for Streamlit Cloud) ───
+# To untrack if you don't want it committed, comment out the next line:
+# fisheries.db
 
 # ── Source presentation (large binary) ───────────────────────────────────────
 *.pptx

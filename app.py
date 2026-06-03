@@ -1,31 +1,49 @@
 # =============================================================================
 # app.py  —  Fisheries Sector Progress-Report Dashboard
 # =============================================================================
-# Bilingual (Arabic / English), read-only, on-premise Streamlit dashboard.
-# Reads data from a local Microsoft Access database (.accdb) via pyodbc.
-# Data is cached for 10 minutes; changing the database file triggers a refresh
-# on the next page load once the cache expires.
+# Bilingual (Arabic / English), read-only dashboard.
+#
+# DUAL DATABASE BACKEND:
+#   • Windows on-prem  →  Microsoft Access (.accdb) via pyodbc  [ReadOnly=1]
+#   • Streamlit Cloud / Linux  →  SQLite (.db) via built-in sqlite3
+#
+# Backend is selected automatically from DB_PATH file extension:
+#   .accdb  →  pyodbc / Access ODBC  (Windows only)
+#   .db     →  sqlite3               (any platform)
+#
+# DB_PATH resolution order:
+#   1. .streamlit/secrets.toml  [database] path = "..."
+#   2. Environment variable  DB_PATH=...
+#   3. Auto-detect: FisheriesQ1_2026.accdb (Windows) or fisheries.db (Linux)
 #
 # SECURITY MODEL (network-level):
-#   • All SQL is SELECT-only — no INSERT / UPDATE / DELETE / DDL anywhere here.
-#   • The ODBC connection string includes ReadOnly=1.
-#   • pyodbc is opened with readonly=True.
-#   • DB_PATH is read from environment / secrets — never hard-coded in source.
-#   • Bind the server to an internal interface (see .streamlit/config.toml).
-#   • Protect the port with your on-prem firewall and/or VPN.
-#   • Grant the service account read-only NTFS permissions on the .accdb file.
+#   • All SQL is SELECT-only — no INSERT / UPDATE / DELETE anywhere here.
+#   • Access: ReadOnly=1 + readonly=True in connection.
+#   • SQLite: opened in read-only URI mode (uri=True, ?mode=ro).
+#   • DB_PATH is never hard-coded in source.
 #
 # RUN:
 #   streamlit run app.py
 # =============================================================================
 
 import os
-import pyodbc
+import sys
+import sqlite3
+import platform
+from contextlib import contextmanager
+
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 from dotenv import load_dotenv
+
+# Optional pyodbc — only needed on Windows with Access backend
+try:
+    import pyodbc
+    _PYODBC_OK = True
+except ImportError:
+    _PYODBC_OK = False
 
 # --------------------------------------------------------------------------- #
 # 1. CONFIGURATION                                                             #
@@ -33,27 +51,36 @@ from dotenv import load_dotenv
 
 load_dotenv()  # load DB_PATH from .env if present
 
-# Resolve DB path from (in priority order):
-#   1. .streamlit/secrets.toml  →  [database] path = "..."
-#   2. Environment variable      DB_PATH=...
-#   3. Default: same folder as app.py
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---------- DB_PATH resolution (priority order) ----------
 try:
-    _DB_PATH = st.secrets["database"]["path"]
+    DB_PATH = st.secrets["database"]["path"]          # 1. secrets.toml
 except Exception:
-    _DB_PATH = os.environ.get(
-        "DB_PATH",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "FisheriesQ1_2026.accdb"),
-    )
+    DB_PATH = os.environ.get("DB_PATH", "")           # 2. env var
 
-DB_PATH = _DB_PATH
+if not DB_PATH:
+    # 3. Auto-detect: prefer .accdb on Windows, .db elsewhere
+    _accdb = os.path.join(_SCRIPT_DIR, "FisheriesQ1_2026.accdb")
+    _sqlite = os.path.join(_SCRIPT_DIR, "fisheries.db")
+    if sys.platform == "win32" and os.path.exists(_accdb):
+        DB_PATH = _accdb
+    else:
+        DB_PATH = _sqlite
 
-# Read-only Access ODBC connection string.
-# The Access ODBC driver is Windows-only; see the Dockerfile for the Linux caveat.
-CONN_STR = (
+# ---------- Backend selection ----------
+_EXT = os.path.splitext(DB_PATH)[1].lower()
+USE_SQLITE = (_EXT == ".db") or (not _PYODBC_OK)
+
+# Access ODBC connection string (used only when USE_SQLITE is False)
+_ODBC_CONN_STR = (
     r"DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};"
     f"DBQ={DB_PATH};"
-    r"ReadOnly=1;"          # instructs the ODBC driver to open in read-only mode
+    r"ReadOnly=1;"
 )
+
+# SQLite read-only URI (used when USE_SQLITE is True)
+_SQLITE_URI = f"file:{DB_PATH}?mode=ro"
 
 # Plotly font — supports Arabic Unicode rendering
 CHART_FONT = dict(family="Arial Unicode MS, Segoe UI, Arial, sans-serif", size=13)
@@ -377,9 +404,21 @@ def growth_delta(pct_fraction) -> tuple:
 # 4. DATABASE QUERIES (all read-only, cached for 10 minutes)                  #
 # --------------------------------------------------------------------------- #
 
+@contextmanager
 def _get_connection():
-    """Open a read-only pyodbc connection.  Raises on failure."""
-    return pyodbc.connect(CONN_STR, readonly=True)
+    """
+    Context-manager that yields a read-only DB connection and always closes it.
+    Uses sqlite3 on Streamlit Cloud / Linux; pyodbc on Windows with Access.
+    """
+    if USE_SQLITE:
+        # sqlite3 read-only URI mode — no writes possible
+        conn = sqlite3.connect(_SQLITE_URI, uri=True, check_same_thread=False)
+    else:
+        conn = pyodbc.connect(_ODBC_CONN_STR, readonly=True)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _query(sql: str, conn) -> pd.DataFrame:
@@ -772,6 +811,8 @@ def render_sidebar() -> str:
         st.divider()
         st.caption(f"📁 {t('db_path_label')}")
         st.code(os.path.basename(DB_PATH), language=None)
+        backend_label = "SQLite" if USE_SQLITE else "Access / pyodbc"
+        st.caption(f"🔌 {backend_label}")
 
         st.caption(f"🔄 {t('data_refresh')}")
 
@@ -807,11 +848,11 @@ def main():
 
     # --- Database connectivity check ----------------------------------------
     try:
-        conn_test = _get_connection()
-        conn_test.close()
+        with _get_connection() as _test:
+            pass  # just verify the connection opens cleanly
     except Exception as e:
         st.error(f"⚠️  {t('error_db')}\n\n`{e}`")
-        st.info(f"DB_PATH = `{DB_PATH}`")
+        st.info(f"DB_PATH = `{DB_PATH}`  (backend: {'SQLite' if USE_SQLITE else 'Access/pyodbc'})")
         st.stop()
 
     # --- Load all data ------------------------------------------------------
