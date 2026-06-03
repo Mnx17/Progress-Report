@@ -310,26 +310,163 @@ def fmt_pct(value) -> str:
 
 def inject_css(lang: str) -> None:
     """
-    Inject global CSS.  When Arabic is active, set direction: rtl on the
-    main content container, sidebar, metric cards, and data tables.
-    Always inject the KPI card styling (language-independent).
+    Inject global CSS + direction switching.
+
+    RTL strategy (Arabic mode):
+      1. Set direction:rtl on .stApp — the outermost Streamlit wrapper.
+         This cascades direction to every child automatically.
+      2. Explicitly right-align text in all known Streamlit 1.5x containers
+         (data-testid selectors are stable across emotion-cache renames).
+      3. Pin Plotly chart containers back to ltr so chart axes stay correct.
+      4. Custom HTML elements (.report-header, .section-header, .source-note)
+         are written with an inline dir= attribute (see section_header /
+         report header below), so they flip independently of the cascade.
+
+    LTR mode (English): the direction block is simply absent — browser
+    defaults to ltr so no explicit reset is needed.
     """
+    is_rtl  = (lang == "ar")
+    ta      = "right" if is_rtl else "left"       # text-align shorthand
+    hdr_ta  = "right" if is_rtl else "center"     # report-header alignment
+    note_ta = "right" if is_rtl else "center"     # footer alignment
+    grad    = ("270deg" if is_rtl                  # gradient flips for RTL
+               else "90deg")
+
     rtl_block = ""
-    if lang == "ar":
-        rtl_block = """
-        /* ---- RTL layout ---- */
-        .main .block-container             { direction: rtl; text-align: right; }
-        [data-testid="stSidebar"]          { direction: rtl; text-align: right; }
-        [data-testid="metric-container"]   { direction: rtl; text-align: right; }
-        h1, h2, h3, h4, p, li             { direction: rtl; text-align: right; }
-        .stDataFrame, .stTable            { direction: rtl; }
-        [data-testid="stExpander"]         { direction: rtl; text-align: right; }
-        label, .stRadio label             { direction: rtl; }
+    if is_rtl:
+        rtl_block = f"""
+        /* ============================================================
+           GLOBAL RTL — Arabic mode
+           All rules use !important to override Streamlit's own styles.
+           ============================================================ */
+
+        /* 1. Root app wrapper: set direction here and let it cascade */
+        .stApp {{
+            direction: rtl !important;
+        }}
+
+        /* 2. Main content containers */
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        [data-testid="stMainBlockContainer"],
+        .main, .block-container,
+        .main .block-container {{
+            direction: rtl !important;
+        }}
+
+        /* 3. Every vertical / horizontal block */
+        [data-testid="stVerticalBlock"],
+        [data-testid="stVerticalBlockBorderWrapper"],
+        [data-testid="stHorizontalBlock"] {{
+            direction: rtl !important;
+        }}
+
+        /* 4. Columns */
+        [data-testid="column"] {{
+            direction: rtl !important;
+        }}
+
+        /* 5. Sidebar */
+        [data-testid="stSidebar"],
+        [data-testid="stSidebarContent"],
+        [data-testid="stSidebar"] .block-container {{
+            direction: rtl !important;
+            text-align: right !important;
+        }}
+
+        /* 6. All text / markdown */
+        [data-testid="stMarkdownContainer"],
+        [data-testid="stMarkdownContainer"] p,
+        [data-testid="stMarkdownContainer"] li,
+        [data-testid="stMarkdownContainer"] ul,
+        [data-testid="stMarkdownContainer"] ol,
+        p, li, ul, ol {{
+            direction: rtl !important;
+            text-align: right !important;
+        }}
+
+        /* 7. Headings (both Streamlit-wrapped and bare) */
+        [data-testid="stHeading"],
+        h1, h2, h3, h4, h5, h6 {{
+            direction: rtl !important;
+            text-align: right !important;
+        }}
+
+        /* 8. KPI metric cards — label, value, delta each get explicit RTL */
+        [data-testid="metric-container"] {{
+            direction: rtl !important;
+            text-align: right !important;
+        }}
+        [data-testid="stMetricLabel"],
+        [data-testid="metric-container"] label {{
+            direction: rtl !important;
+            text-align: right !important;
+            display: block !important;
+        }}
+        [data-testid="stMetricValue"] {{
+            direction: rtl !important;
+            text-align: right !important;
+            display: block !important;
+        }}
+        [data-testid="stMetricDelta"] {{
+            direction: rtl !important;
+            text-align: right !important;
+            display: block !important;
+        }}
+
+        /* 9. Expanders */
+        [data-testid="stExpander"],
+        [data-testid="stExpander"] summary,
+        [data-testid="stExpander"] > div {{
+            direction: rtl !important;
+            text-align: right !important;
+        }}
+
+        /* 10. Select box & radio */
+        [data-testid="stSelectbox"] label,
+        [data-testid="stRadio"] label,
+        label {{
+            direction: rtl !important;
+            text-align: right !important;
+        }}
+
+        /* 11. Captions */
+        [data-testid="stCaptionContainer"],
+        [data-testid="stCaption"],
+        small, caption {{
+            direction: rtl !important;
+            text-align: right !important;
+        }}
+
+        /* 12. DataFrames — swap header/cell alignment */
+        [data-testid="stDataFrameResizable"] th,
+        [data-testid="stDataFrameResizable"] td,
+        .stDataFrame th, .stDataFrame td,
+        table th, table td {{
+            direction: rtl !important;
+            text-align: right !important;
+        }}
+
+        /* 13. Code / pre blocks stay LTR (paths, filenames, numbers) */
+        code, pre, [data-testid="stCode"] {{
+            direction: ltr !important;
+            text-align: left !important;
+        }}
+
+        /* 14. Plotly charts: pin to LTR — Plotly handles its own RTL
+               via the layout settings set in each chart builder function */
+        .js-plotly-plot, .plotly, [data-testid="stPlotlyChart"] {{
+            direction: ltr !important;
+        }}
         """
 
     st.markdown(f"""
     <style>
-    /* ---- KPI Card styling (both languages) ---- */
+    /* ============================================================
+       BASE STYLES — language-independent
+       ============================================================ */
+
+    /* KPI Cards */
     [data-testid="metric-container"] {{
         background: linear-gradient(135deg, #f8fbff 0%, #eaf3ff 100%);
         border-radius: 12px;
@@ -352,44 +489,54 @@ def inject_css(lang: str) -> None:
         font-size: 0.95rem;
         font-weight: 600;
     }}
-    /* ---- Section divider ---- */
+
+    /* Section header bar — gradient direction aware */
     .section-header {{
-        background: linear-gradient(90deg, #003366 0%, #0066CC 100%);
+        background: linear-gradient({grad}, #003366 0%, #0066CC 100%);
         color: white;
         padding: 10px 18px;
         border-radius: 8px;
         margin: 28px 0 16px 0;
         font-size: 1.05rem;
         font-weight: 700;
+        text-align: {ta};
     }}
-    /* ---- Report header ---- */
+
+    /* Report header banner */
     .report-header {{
         background: linear-gradient(135deg, #002244 0%, #003366 50%, #0055AA 100%);
         color: white;
         padding: 28px 32px;
         border-radius: 14px;
         margin-bottom: 24px;
-        text-align: center;
+        text-align: {hdr_ta};
     }}
     .report-header h1 {{ color: white; margin: 0; font-size: 1.7rem; }}
     .report-header p  {{ color: #A8CFFF; margin: 6px 0 0 0; font-size: 1rem; }}
-    /* ---- Source footnote ---- */
+
+    /* Footer note */
     .source-note {{
         color: #7f8c8d;
         font-size: 0.78rem;
-        text-align: center;
+        text-align: {note_ta};
         margin-top: 32px;
         padding-top: 10px;
         border-top: 1px solid #ecf0f1;
     }}
+
     {rtl_block}
     </style>
     """, unsafe_allow_html=True)
 
 
 def section_header(text: str) -> None:
-    """Render a styled section header."""
-    st.markdown(f'<div class="section-header">{text}</div>', unsafe_allow_html=True)
+    """Render a styled section header, with dir attribute set from current lang."""
+    lang = st.session_state.get("lang", "en")
+    direction = "rtl" if lang == "ar" else "ltr"
+    st.markdown(
+        f'<div class="section-header" dir="{direction}">{text}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def growth_delta(pct_fraction) -> tuple:
@@ -873,8 +1020,9 @@ def main():
     report_title  = meta.get(title_key, t("page_title"))
     period_label  = meta.get(period_key, t("quarter_badge"))
 
+    _dir = "rtl" if lang == "ar" else "ltr"
     st.markdown(
-        f'<div class="report-header">'
+        f'<div class="report-header" dir="{_dir}">'
         f'<h1>{report_title}</h1>'
         f'<p>{period_label}</p>'
         f'</div>',
@@ -1086,7 +1234,7 @@ def main():
 
     # --- Footer ------------------------------------------------------------
     st.markdown(
-        f'<p class="source-note">{t("data_source")} &nbsp;|&nbsp; {t("currency_note")}</p>',
+        f'<p class="source-note" dir="{_dir}">{t("data_source")} &nbsp;|&nbsp; {t("currency_note")}</p>',
         unsafe_allow_html=True,
     )
 
