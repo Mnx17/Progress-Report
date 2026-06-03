@@ -198,6 +198,10 @@ T = {
         "no_data":               "No data available.",
         "currency_note":         "Values in Thousand Omani Rials (OMR)",
         "data_source":           "Source: Q1 2026 Fisheries Progress Report",
+        # Share panel
+        "share_header":          "🔗 Share Dashboard",
+        "share_note":            "View-only · opens in the same language",
+        "share_copied":          "✅ Link ready — paste it anywhere",
     },
 
     "ar": {
@@ -273,6 +277,10 @@ T = {
         "no_data":               "لا توجد بيانات.",
         "currency_note":         "القيم بألف ريال عماني",
         "data_source":           "المصدر: التقرير المرحلي للربع الأول 2026",
+        # Share panel
+        "share_header":          "🔗 مشاركة اللوحة",
+        "share_note":            "للعرض فقط · يفتح بنفس اللغة",
+        "share_copied":          "✅ الرابط جاهز — انسخه وشاركه",
     },
 }
 
@@ -938,13 +946,47 @@ def chart_vessels(df_vessels: pd.DataFrame, lang: str, top_n: int = 15) -> go.Fi
 # 6. SIDEBAR                                                                   #
 # --------------------------------------------------------------------------- #
 
+def _build_share_url(lang: str) -> str:
+    """
+    Build the full shareable URL including ?lang=.
+    Uses the Referer header (most reliable source of the full URL in Streamlit)
+    and falls back to the Host header, then a relative URL.
+    """
+    try:
+        headers = st.context.headers
+        # Referer gives us the full current URL including protocol + host
+        referer = headers.get("Referer", "") or headers.get("referer", "")
+        if referer:
+            # Strip any existing query string, then append ?lang=
+            base = referer.split("?")[0].rstrip("/")
+            return f"{base}?lang={lang}"
+        # Fallback: build from Host header
+        host = headers.get("Host", "") or headers.get("host", "")
+        if host:
+            proto = "https" if ("streamlit.app" in host or ":443" in host) else "http"
+            return f"{proto}://{host}?lang={lang}"
+    except Exception:
+        pass
+    # Last resort — relative URL (user can prepend their host)
+    return f"?lang={lang}"
+
+
 def render_sidebar() -> str:
-    """Render sidebar controls.  Returns selected language code ('en' or 'ar')."""
+    """
+    Render sidebar controls.  Returns the active language code ('en' or 'ar').
+
+    View-only share link
+    --------------------
+    The current language is synced to the URL query parameter ?lang=.
+    Anyone opening that URL gets the dashboard in the same language.
+    The dashboard is inherently view-only: all SQL is SELECT-only and the
+    DB connection is opened with ReadOnly=1 / SQLite read-only URI mode.
+    """
     with st.sidebar:
         st.markdown(f"### {t('sidebar_title')}")
         st.divider()
 
-        # Language toggle
+        # ── Language toggle ──────────────────────────────────────────────────
         lang_choice = st.radio(
             t("language_label"),
             options=["English", "العربية"],
@@ -955,13 +997,42 @@ def render_sidebar() -> str:
         lang = "ar" if lang_choice == "العربية" else "en"
         st.session_state["lang"] = lang
 
+        # Sync language into the browser URL (?lang=ar / ?lang=en).
+        # This makes the address bar always reflect the current language
+        # so copying the URL gives a ready-to-share link.
+        try:
+            if st.query_params.get("lang") != lang:
+                st.query_params["lang"] = lang
+        except Exception:
+            pass  # query_params unavailable in some embedded environments
+
         st.divider()
+
+        # ── Database / cache info ────────────────────────────────────────────
         st.caption(f"📁 {t('db_path_label')}")
         st.code(os.path.basename(DB_PATH), language=None)
         backend_label = "SQLite" if USE_SQLITE else "Access / pyodbc"
         st.caption(f"🔌 {backend_label}")
-
         st.caption(f"🔄 {t('data_refresh')}")
+
+        st.divider()
+
+        # ── View-only share panel ────────────────────────────────────────────
+        st.markdown(f"**{t('share_header')}**")
+
+        share_url = _build_share_url(lang)
+
+        # Render URL in a plain HTML monospace box — no widget state, always
+        # reflects the current lang.  User clicks → Ctrl/Cmd+A → Ctrl/Cmd+C.
+        st.markdown(
+            f'<div style="background:#eef2f7;border:1px solid #c9d9ee;'
+            f'border-radius:6px;padding:8px 12px;font-family:monospace;'
+            f'font-size:11.5px;word-break:break-all;direction:ltr;'
+            f'color:#1a2a3a;user-select:all;cursor:text;">'
+            f'{share_url}</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(f"👁️ {t('share_note')}")
 
         st.divider()
         st.caption(t("data_source"))
@@ -983,9 +1054,17 @@ def main():
         initial_sidebar_state="expanded",
     )
 
-    # Default language
+    # ── Language initialisation ──────────────────────────────────────────────
+    # Priority order:
+    #   1. ?lang=ar/en in the URL  ← shared links land here with the right lang
+    #   2. st.session_state["lang"] preserved across rerenders
+    #   3. Default: "en"
     if "lang" not in st.session_state:
-        st.session_state["lang"] = "en"
+        try:
+            url_lang = st.query_params.get("lang", "en")
+            st.session_state["lang"] = url_lang if url_lang in ("en", "ar") else "en"
+        except Exception:
+            st.session_state["lang"] = "en"
 
     # Render sidebar first (sets session_state lang)
     lang = render_sidebar()
