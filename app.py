@@ -1,0 +1,1057 @@
+# =============================================================================
+# app.py  —  Fisheries Sector Progress-Report Dashboard
+# =============================================================================
+# Bilingual (Arabic / English), read-only, on-premise Streamlit dashboard.
+# Reads data from a local Microsoft Access database (.accdb) via pyodbc.
+# Data is cached for 10 minutes; changing the database file triggers a refresh
+# on the next page load once the cache expires.
+#
+# SECURITY MODEL (network-level):
+#   • All SQL is SELECT-only — no INSERT / UPDATE / DELETE / DDL anywhere here.
+#   • The ODBC connection string includes ReadOnly=1.
+#   • pyodbc is opened with readonly=True.
+#   • DB_PATH is read from environment / secrets — never hard-coded in source.
+#   • Bind the server to an internal interface (see .streamlit/config.toml).
+#   • Protect the port with your on-prem firewall and/or VPN.
+#   • Grant the service account read-only NTFS permissions on the .accdb file.
+#
+# RUN:
+#   streamlit run app.py
+# =============================================================================
+
+import os
+import pyodbc
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from dotenv import load_dotenv
+
+# --------------------------------------------------------------------------- #
+# 1. CONFIGURATION                                                             #
+# --------------------------------------------------------------------------- #
+
+load_dotenv()  # load DB_PATH from .env if present
+
+# Resolve DB path from (in priority order):
+#   1. .streamlit/secrets.toml  →  [database] path = "..."
+#   2. Environment variable      DB_PATH=...
+#   3. Default: same folder as app.py
+try:
+    _DB_PATH = st.secrets["database"]["path"]
+except Exception:
+    _DB_PATH = os.environ.get(
+        "DB_PATH",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "FisheriesQ1_2026.accdb"),
+    )
+
+DB_PATH = _DB_PATH
+
+# Read-only Access ODBC connection string.
+# The Access ODBC driver is Windows-only; see the Dockerfile for the Linux caveat.
+CONN_STR = (
+    r"DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};"
+    f"DBQ={DB_PATH};"
+    r"ReadOnly=1;"          # instructs the ODBC driver to open in read-only mode
+)
+
+# Plotly font — supports Arabic Unicode rendering
+CHART_FONT = dict(family="Arial Unicode MS, Segoe UI, Arial, sans-serif", size=13)
+
+# Brand colour palette (marine theme)
+C_NAVY    = "#003366"   # primary navy
+C_BLUE    = "#0066CC"   # secondary blue
+C_TEAL    = "#008B8B"   # teal (coastal)
+C_ORANGE  = "#D35400"   # coral orange (commercial)
+C_GREEN   = "#27AE60"   # sea green (aquaculture / growth positive)
+C_RED     = "#C0392B"   # deep red (decline / negative)
+C_LBLUE   = "#85C1E9"   # light blue (2025 comparison)
+
+# Chart colours for sectors  [Artisanal, Coastal, Commercial, Aquaculture]
+SECTOR_COLORS = [C_NAVY, C_TEAL, C_ORANGE, C_GREEN]
+
+# Chart colours for governorates (6 entries)
+GOV_COLORS = ["#003366", "#0066CC", "#008B8B", "#D35400", "#27AE60", "#8E44AD"]
+
+# Month name lookup  {1: {"en": "January", "ar": "يناير"}, …}
+MONTHS = {
+    1: {"en": "January",  "ar": "يناير"},
+    2: {"en": "February", "ar": "فبراير"},
+    3: {"en": "March",    "ar": "مارس"},
+    4: {"en": "April",    "ar": "أبريل"},
+    5: {"en": "May",      "ar": "مايو"},
+    6: {"en": "June",     "ar": "يونيو"},
+    7: {"en": "July",     "ar": "يوليو"},
+    8: {"en": "August",   "ar": "أغسطس"},
+    9: {"en": "September","ar": "سبتمبر"},
+   10: {"en": "October",  "ar": "أكتوبر"},
+   11: {"en": "November", "ar": "نوفمبر"},
+   12: {"en": "December", "ar": "ديسمبر"},
+}
+
+
+# --------------------------------------------------------------------------- #
+# 2. TRANSLATION DICTIONARY                                                    #
+# --------------------------------------------------------------------------- #
+# All user-visible strings that are NOT pulled directly from the database.
+# Key naming convention: snake_case.  Access with t(key) helper.
+# --------------------------------------------------------------------------- #
+
+T = {
+    "en": {
+        # --- Sidebar ---
+        "language_label":        "Language / اللغة",
+        "db_path_label":         "Database Path",
+        "sidebar_title":         "Fisheries Dashboard",
+        "data_refresh":          "Data refreshes every 10 minutes",
+
+        # --- Page header ---
+        "page_title":            "Fisheries Sector — Statistical Indicators",
+        "quarter_badge":         "Q1 2026 · January – March",
+
+        # --- KPI Cards ---
+        "kpi_total_qty":         "Total Production",
+        "kpi_total_val":         "Total Value",
+        "kpi_artisanal_share":   "Artisanal Share",
+        "kpi_aqua_growth":       "Aquaculture Growth",
+        "unit_k_tons":           "Thousand Tons",
+        "unit_m_omr":            "Million OMR",
+        "unit_pct":              "%",
+        "vs_2025":               "vs 2025",
+
+        # --- Section headers ---
+        "sec_overview":          "📊  Monthly Production Overview",
+        "sec_sectors":           "🏭  Production by Fishing Sector",
+        "sec_artisanal":         "⛵  Artisanal Fishing",
+        "sec_aquaculture":       "🐟  Aquaculture",
+        "sec_commercial":        "🚢  Commercial Fishing",
+        "sec_raw":               "📋  Raw Data Tables",
+
+        # --- Chart titles ---
+        "chart_monthly_overall": "Overall Monthly Production — 2025 vs 2026 (Thousand Tons)",
+        "chart_sector_donut":    "Production Share by Sector",
+        "chart_sector_bar":      "Sector Production — 2025 vs 2026",
+        "chart_gov_bar":         "Artisanal Production by Governorate (Thousand Tons)",
+        "chart_gov_donut":       "Artisanal Share by Governorate",
+        "chart_top_species":     "Top 5 Artisanal Species by Share",
+        "chart_aqua_species":    "Aquaculture Production by Species",
+        "chart_vessels":         "Commercial Production by Vessel (Top 15)",
+        "chart_vessels_full":    "All Commercial Vessels — Q1 2026",
+
+        # --- Axis / legend labels ---
+        "axis_qty_tons":         "Quantity (Tons)",
+        "axis_qty_ktons":        "Quantity (Thousand Tons)",
+        "axis_val_komr":         "Value (Thousand OMR)",
+        "axis_share_pct":        "Share (%)",
+        "lbl_2025":              "2025",
+        "lbl_2026":              "2026",
+        "lbl_quantity":          "Quantity",
+        "lbl_value":             "Value",
+        "lbl_growth":            "Growth",
+        "lbl_vessel":            "Vessel",
+        "lbl_production":        "Production (Tons)",
+        "lbl_species":           "Species",
+        "lbl_share":             "Share",
+        "lbl_governorate":       "Governorate",
+        "lbl_sector":            "Sector",
+        "lbl_month":             "Month",
+        "lbl_jan":               "January",
+        "lbl_feb":               "February",
+        "lbl_mar":               "March",
+        "lbl_total":             "Q1 Total",
+
+        # --- Raw data expanders ---
+        "exp_monthly_qty":       "Monthly Production by Sector — Quantity (Tons)",
+        "exp_monthly_val":       "Monthly Production by Sector — Value (Thousand OMR)",
+        "exp_gov_qty":           "Artisanal by Governorate — Quantity (Tons)",
+        "exp_vessels":           "Commercial Fishing — All Vessels",
+
+        # --- Misc ---
+        "error_db":              "Cannot connect to the database. Check DB_PATH and ODBC driver.",
+        "no_data":               "No data available.",
+        "currency_note":         "Values in Thousand Omani Rials (OMR)",
+        "data_source":           "Source: Q1 2026 Fisheries Progress Report",
+    },
+
+    "ar": {
+        # --- Sidebar ---
+        "language_label":        "اللغة / Language",
+        "db_path_label":         "مسار قاعدة البيانات",
+        "sidebar_title":         "لوحة القطاع السمكي",
+        "data_refresh":          "تتجدد البيانات كل 10 دقائق",
+
+        # --- Page header ---
+        "page_title":            "البيانات والمؤشرات الإحصائية للقطاع السمكي",
+        "quarter_badge":         "الربع الأول 2026 · يناير – مارس",
+
+        # --- KPI Cards ---
+        "kpi_total_qty":         "إجمالي الإنتاج",
+        "kpi_total_val":         "إجمالي القيمة",
+        "kpi_artisanal_share":   "نسبة الصيد الحرفي",
+        "kpi_aqua_growth":       "نمو الاستزراع",
+        "unit_k_tons":           "ألف طن",
+        "unit_m_omr":            "مليون ريال عماني",
+        "unit_pct":              "%",
+        "vs_2025":               "مقارنة بـ 2025",
+
+        # --- Section headers ---
+        "sec_overview":          "📊  نظرة عامة على الإنتاج الشهري",
+        "sec_sectors":           "🏭  الإنتاج حسب قطاع الصيد",
+        "sec_artisanal":         "⛵  الصيد الحرفي",
+        "sec_aquaculture":       "🐟  الاستزراع السمكي",
+        "sec_commercial":        "🚢  الصيد التجاري",
+        "sec_raw":               "📋  جداول البيانات التفصيلية",
+
+        # --- Chart titles ---
+        "chart_monthly_overall": "الإنتاج الشهري الإجمالي — 2025 مقابل 2026 (ألف طن)",
+        "chart_sector_donut":    "نسب الإنتاج حسب قطاع الصيد",
+        "chart_sector_bar":      "الإنتاج حسب القطاع — 2025 مقابل 2026",
+        "chart_gov_bar":         "إنتاج الصيد الحرفي حسب المحافظات (ألف طن)",
+        "chart_gov_donut":       "نسبة مساهمة المحافظات في الصيد الحرفي",
+        "chart_top_species":     "أعلى 5 أنواع في الصيد الحرفي",
+        "chart_aqua_species":    "إنتاج الاستزراع السمكي حسب الأنواع",
+        "chart_vessels":         "إنتاج الصيد التجاري حسب السفن (أعلى 15)",
+        "chart_vessels_full":    "جميع سفن الصيد التجاري — الربع الأول 2026",
+
+        # --- Axis / legend labels ---
+        "axis_qty_tons":         "الكمية (طن)",
+        "axis_qty_ktons":        "الكمية (ألف طن)",
+        "axis_val_komr":         "القيمة (ألف ريال عماني)",
+        "axis_share_pct":        "النسبة (%)",
+        "lbl_2025":              "2025",
+        "lbl_2026":              "2026",
+        "lbl_quantity":          "الكمية",
+        "lbl_value":             "القيمة",
+        "lbl_growth":            "النمو",
+        "lbl_vessel":            "السفينة",
+        "lbl_production":        "الإنتاج (طن)",
+        "lbl_species":           "النوع",
+        "lbl_share":             "النسبة",
+        "lbl_governorate":       "المحافظة",
+        "lbl_sector":            "القطاع",
+        "lbl_month":             "الشهر",
+        "lbl_jan":               "يناير",
+        "lbl_feb":               "فبراير",
+        "lbl_mar":               "مارس",
+        "lbl_total":             "إجمالي الربع الأول",
+
+        # --- Raw data expanders ---
+        "exp_monthly_qty":       "الإنتاج الشهري حسب القطاع — الكمية (طن)",
+        "exp_monthly_val":       "الإنتاج الشهري حسب القطاع — القيمة (ألف ريال عماني)",
+        "exp_gov_qty":           "الصيد الحرفي حسب المحافظات — الكمية (طن)",
+        "exp_vessels":           "الصيد التجاري — جميع السفن",
+
+        # --- Misc ---
+        "error_db":              "تعذّر الاتصال بقاعدة البيانات. تحقق من مسار الملف وبرنامج تشغيل ODBC.",
+        "no_data":               "لا توجد بيانات.",
+        "currency_note":         "القيم بألف ريال عماني",
+        "data_source":           "المصدر: التقرير المرحلي للربع الأول 2026",
+    },
+}
+
+
+# --------------------------------------------------------------------------- #
+# 3. HELPER FUNCTIONS                                                          #
+# --------------------------------------------------------------------------- #
+
+def t(key: str) -> str:
+    """Return the translated string for the current language."""
+    lang = st.session_state.get("lang", "en")
+    return T.get(lang, T["en"]).get(key, key)
+
+
+def month_label(month_no: int) -> str:
+    """Return the month name in the current language."""
+    lang = st.session_state.get("lang", "en")
+    return MONTHS.get(month_no, {}).get(lang, str(month_no))
+
+
+def fmt_num(value, decimals: int = 1) -> str:
+    """Format a number with thousands separator."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    return f"{value:,.{decimals}f}"
+
+
+def fmt_pct(value) -> str:
+    """Format a growth value (decimal fraction) as a percentage string."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value * 100:.0f}%"
+
+
+def inject_css(lang: str) -> None:
+    """
+    Inject global CSS.  When Arabic is active, set direction: rtl on the
+    main content container, sidebar, metric cards, and data tables.
+    Always inject the KPI card styling (language-independent).
+    """
+    rtl_block = ""
+    if lang == "ar":
+        rtl_block = """
+        /* ---- RTL layout ---- */
+        .main .block-container             { direction: rtl; text-align: right; }
+        [data-testid="stSidebar"]          { direction: rtl; text-align: right; }
+        [data-testid="metric-container"]   { direction: rtl; text-align: right; }
+        h1, h2, h3, h4, p, li             { direction: rtl; text-align: right; }
+        .stDataFrame, .stTable            { direction: rtl; }
+        [data-testid="stExpander"]         { direction: rtl; text-align: right; }
+        label, .stRadio label             { direction: rtl; }
+        """
+
+    st.markdown(f"""
+    <style>
+    /* ---- KPI Card styling (both languages) ---- */
+    [data-testid="metric-container"] {{
+        background: linear-gradient(135deg, #f8fbff 0%, #eaf3ff 100%);
+        border-radius: 12px;
+        border: 1px solid #d0e4f7;
+        padding: 18px 20px;
+        box-shadow: 0 2px 8px rgba(0,51,102,0.07);
+    }}
+    [data-testid="metric-container"] label {{
+        color: #003366;
+        font-weight: 600;
+        font-size: 0.85rem;
+        letter-spacing: 0.03em;
+    }}
+    [data-testid="stMetricValue"] {{
+        color: #003366;
+        font-size: 2rem !important;
+        font-weight: 700;
+    }}
+    [data-testid="stMetricDelta"] {{
+        font-size: 0.95rem;
+        font-weight: 600;
+    }}
+    /* ---- Section divider ---- */
+    .section-header {{
+        background: linear-gradient(90deg, #003366 0%, #0066CC 100%);
+        color: white;
+        padding: 10px 18px;
+        border-radius: 8px;
+        margin: 28px 0 16px 0;
+        font-size: 1.05rem;
+        font-weight: 700;
+    }}
+    /* ---- Report header ---- */
+    .report-header {{
+        background: linear-gradient(135deg, #002244 0%, #003366 50%, #0055AA 100%);
+        color: white;
+        padding: 28px 32px;
+        border-radius: 14px;
+        margin-bottom: 24px;
+        text-align: center;
+    }}
+    .report-header h1 {{ color: white; margin: 0; font-size: 1.7rem; }}
+    .report-header p  {{ color: #A8CFFF; margin: 6px 0 0 0; font-size: 1rem; }}
+    /* ---- Source footnote ---- */
+    .source-note {{
+        color: #7f8c8d;
+        font-size: 0.78rem;
+        text-align: center;
+        margin-top: 32px;
+        padding-top: 10px;
+        border-top: 1px solid #ecf0f1;
+    }}
+    {rtl_block}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def section_header(text: str) -> None:
+    """Render a styled section header."""
+    st.markdown(f'<div class="section-header">{text}</div>', unsafe_allow_html=True)
+
+
+def growth_delta(pct_fraction) -> tuple:
+    """Return (delta_string, delta_color_indicator) for st.metric."""
+    if pct_fraction is None or (isinstance(pct_fraction, float) and pd.isna(pct_fraction)):
+        return None, None
+    label = fmt_pct(pct_fraction) + f" {t('vs_2025')}"
+    return label, pct_fraction
+
+
+# --------------------------------------------------------------------------- #
+# 4. DATABASE QUERIES (all read-only, cached for 10 minutes)                  #
+# --------------------------------------------------------------------------- #
+
+def _get_connection():
+    """Open a read-only pyodbc connection.  Raises on failure."""
+    return pyodbc.connect(CONN_STR, readonly=True)
+
+
+def _query(sql: str, conn) -> pd.DataFrame:
+    """
+    Execute a SELECT query and return a DataFrame.
+    Uses cursor directly instead of pd.read_sql() to avoid the
+    'non-SQLAlchemy connection' UserWarning from pandas.
+    All queries are strictly SELECT-only (read-only enforcement).
+    """
+    cursor = conn.cursor()
+    cursor.execute(sql)
+    cols = [d[0] for d in cursor.description]
+    rows = cursor.fetchall()
+    cursor.close()
+    return pd.DataFrame.from_records(rows, columns=cols)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_report_meta() -> dict:
+    """Load the single ReportMeta row."""
+    sql = "SELECT * FROM [ReportMeta]"
+    with _get_connection() as cx:
+        df = _query(sql, cx)
+    if df.empty:
+        return {}
+    return df.iloc[0].to_dict()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_sector_summary() -> pd.DataFrame:
+    """Load FactSectorSummary joined with DimSector."""
+    sql = """
+        SELECT
+            s.[SectorCode],
+            s.[NameAr],
+            s.[NameEn],
+            s.[SortOrder],
+            f.[FiscalYear],
+            f.[QuantityTons],
+            f.[ValueThousandOMR],
+            f.[QtyGrowthPct],
+            f.[ValueGrowthPct]
+        FROM [FactSectorSummary] AS f
+        INNER JOIN [DimSector] AS s ON f.[SectorID] = s.[SectorID]
+        ORDER BY s.[SortOrder], f.[FiscalYear]
+    """
+    with _get_connection() as cx:
+        return _query(sql, cx)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_gov_summary() -> pd.DataFrame:
+    """Load FactGovernorateSummary joined with DimGovernorate."""
+    sql = """
+        SELECT
+            g.[GovCode],
+            g.[NameAr],
+            g.[NameEn],
+            g.[SortOrder],
+            f.[FiscalYear],
+            f.[QuantityTons],
+            f.[ValueThousandOMR],
+            f.[QtyGrowthPct],
+            f.[ValueGrowthPct]
+        FROM [FactGovernorateSummary] AS f
+        INNER JOIN [DimGovernorate] AS g ON f.[GovernorateID] = g.[GovernorateID]
+        ORDER BY g.[SortOrder], f.[FiscalYear]
+    """
+    with _get_connection() as cx:
+        return _query(sql, cx)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_overall_monthly() -> pd.DataFrame:
+    """Load FactOverallMonthly (both years)."""
+    sql = """
+        SELECT [FiscalYear], [MonthNo], [QuantityThousandTons]
+        FROM [FactOverallMonthly]
+        ORDER BY [FiscalYear], [MonthNo]
+    """
+    with _get_connection() as cx:
+        return _query(sql, cx)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_monthly_production() -> pd.DataFrame:
+    """Load FactMonthlyProduction (sector totals only — GovernorateID IS NULL)."""
+    sql = """
+        SELECT
+            mp.[FiscalYear],
+            mp.[MonthNo],
+            s.[SectorCode],
+            s.[NameAr],
+            s.[NameEn],
+            s.[SortOrder],
+            mp.[QuantityTons],
+            mp.[ValueThousandOMR]
+        FROM [FactMonthlyProduction] AS mp
+        INNER JOIN [DimSector] AS s ON mp.[SectorID] = s.[SectorID]
+        WHERE mp.[GovernorateID] IS NULL
+        ORDER BY s.[SortOrder], mp.[MonthNo]
+    """
+    with _get_connection() as cx:
+        return _query(sql, cx)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_gov_monthly() -> pd.DataFrame:
+    """Load FactMonthlyProduction for artisanal-by-governorate rows."""
+    sql = """
+        SELECT
+            mp.[FiscalYear],
+            mp.[MonthNo],
+            g.[GovCode],
+            g.[NameAr],
+            g.[NameEn],
+            g.[SortOrder],
+            mp.[QuantityTons],
+            mp.[ValueThousandOMR]
+        FROM [FactMonthlyProduction] AS mp
+        INNER JOIN [DimGovernorate] AS g ON mp.[GovernorateID] = g.[GovernorateID]
+        WHERE mp.[GovernorateID] IS NOT NULL
+        ORDER BY g.[SortOrder], mp.[MonthNo]
+    """
+    with _get_connection() as cx:
+        return _query(sql, cx)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_aqua_species() -> pd.DataFrame:
+    """Load FactAquacultureSpecies for the current report year."""
+    sql = """
+        SELECT [SpeciesNameAr], [SpeciesNameEn], [QuantityTons], [ValueThousandOMR]
+        FROM [FactAquacultureSpecies]
+        WHERE [FiscalYear] = 2026
+        ORDER BY [QuantityTons] DESC
+    """
+    with _get_connection() as cx:
+        return _query(sql, cx)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_top_species() -> pd.DataFrame:
+    """Load FactArtisanalTopSpecies."""
+    sql = """
+        SELECT [SpeciesNameAr], [SpeciesNameEn], [SharePct], [QuantityTons]
+        FROM [FactArtisanalTopSpecies]
+        WHERE [FiscalYear] = 2026
+        ORDER BY [SharePct] DESC
+    """
+    with _get_connection() as cx:
+        return _query(sql, cx)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_vessels() -> pd.DataFrame:
+    """Load FactCommercialVessel ordered by production descending."""
+    sql = """
+        SELECT [VesselName], [ProductionTons], [Trips]
+        FROM [FactCommercialVessel]
+        WHERE [FiscalYear] = 2026
+        ORDER BY [ProductionTons] DESC
+    """
+    with _get_connection() as cx:
+        return _query(sql, cx)
+
+
+# --------------------------------------------------------------------------- #
+# 5. CHART BUILDERS                                                            #
+# --------------------------------------------------------------------------- #
+
+def _fig_layout(fig, title: str, lang: str, height: int = 400) -> go.Figure:
+    """Apply shared layout settings (font, margins, RTL title alignment)."""
+    title_x = 0.98 if lang == "ar" else 0.02
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=14, color=C_NAVY, family=CHART_FONT["family"]),
+            x=title_x,
+            xanchor="right" if lang == "ar" else "left",
+        ),
+        font=CHART_FONT,
+        height=height,
+        margin=dict(l=40, r=40, t=50, b=40),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.25,
+            xanchor="right" if lang == "ar" else "left",
+            x=1 if lang == "ar" else 0,
+        ),
+    )
+    return fig
+
+
+def chart_overall_monthly(df_monthly: pd.DataFrame, lang: str) -> go.Figure:
+    """Grouped bar chart: overall monthly production 2025 vs 2026."""
+    df25 = df_monthly[df_monthly["FiscalYear"] == 2025].sort_values("MonthNo")
+    df26 = df_monthly[df_monthly["FiscalYear"] == 2026].sort_values("MonthNo")
+    months = [month_label(m) for m in df26["MonthNo"]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name=t("lbl_2025"), x=months, y=df25["QuantityThousandTons"].values,
+        marker_color=C_LBLUE, text=[f"{v:.1f}" for v in df25["QuantityThousandTons"].values],
+        textposition="outside",
+    ))
+    fig.add_trace(go.Bar(
+        name=t("lbl_2026"), x=months, y=df26["QuantityThousandTons"].values,
+        marker_color=C_NAVY, text=[f"{v:.1f}" for v in df26["QuantityThousandTons"].values],
+        textposition="outside",
+    ))
+    fig.update_layout(barmode="group", yaxis_title=t("axis_qty_ktons"))
+    return _fig_layout(fig, t("chart_monthly_overall"), lang, height=380)
+
+
+def chart_sector_donut(df_sector: pd.DataFrame, lang: str, year: int = 2026) -> go.Figure:
+    """Donut chart: production share by sector for a given year."""
+    name_col = "NameAr" if lang == "ar" else "NameEn"
+    df = df_sector[df_sector["FiscalYear"] == year].copy()
+    df = df.sort_values("SortOrder")
+    total = df["QuantityTons"].sum()
+    df["SharePct"] = df["QuantityTons"] / total * 100
+
+    fig = go.Figure(go.Pie(
+        labels=df[name_col].tolist(),
+        values=df["QuantityTons"].tolist(),
+        hole=0.48,
+        marker=dict(colors=SECTOR_COLORS, line=dict(color="white", width=2)),
+        textinfo="label+percent",
+        hovertemplate="%{label}<br>%{value:,.0f} t<br>%{percent}<extra></extra>",
+        textfont=dict(size=11),
+        direction="clockwise",
+    ))
+    fig.add_annotation(
+        text=f"<b>{year}</b>", x=0.5, y=0.5,
+        font=dict(size=18, color=C_NAVY), showarrow=False,
+    )
+    return _fig_layout(fig, t("chart_sector_donut"), lang, height=380)
+
+
+def chart_sector_bar(df_sector: pd.DataFrame, lang: str) -> go.Figure:
+    """Grouped horizontal bar: sector production 2025 vs 2026."""
+    name_col = "NameAr" if lang == "ar" else "NameEn"
+    df25 = df_sector[df_sector["FiscalYear"] == 2025].sort_values("SortOrder")
+    df26 = df_sector[df_sector["FiscalYear"] == 2026].sort_values("SortOrder")
+    sectors = df26[name_col].tolist()
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name=t("lbl_2025"), y=sectors, x=(df25["QuantityTons"] / 1000).values,
+        orientation="h", marker_color=C_LBLUE,
+    ))
+    fig.add_trace(go.Bar(
+        name=t("lbl_2026"), y=sectors, x=(df26["QuantityTons"] / 1000).values,
+        orientation="h", marker_color=C_NAVY,
+    ))
+    fig.update_layout(barmode="group", xaxis_title=t("axis_qty_ktons"))
+    return _fig_layout(fig, t("chart_sector_bar"), lang, height=320)
+
+
+def chart_gov_bar(df_gov: pd.DataFrame, lang: str) -> go.Figure:
+    """Grouped bar: artisanal production by governorate 2025 vs 2026."""
+    name_col = "NameAr" if lang == "ar" else "NameEn"
+    df25 = df_gov[df_gov["FiscalYear"] == 2025].sort_values("SortOrder")
+    df26 = df_gov[df_gov["FiscalYear"] == 2026].sort_values("SortOrder")
+    govs = df26[name_col].tolist()
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name=t("lbl_2025"), x=govs, y=(df25["QuantityTons"] / 1000).values,
+        marker_color=C_LBLUE,
+    ))
+    fig.add_trace(go.Bar(
+        name=t("lbl_2026"), x=govs, y=(df26["QuantityTons"] / 1000).values,
+        marker_color=C_NAVY,
+        text=[fmt_pct(g) for g in df26["QtyGrowthPct"].values],
+        textposition="outside",
+    ))
+    fig.update_layout(barmode="group", yaxis_title=t("axis_qty_ktons"))
+    return _fig_layout(fig, t("chart_gov_bar"), lang, height=380)
+
+
+def chart_gov_donut(df_gov: pd.DataFrame, lang: str) -> go.Figure:
+    """Donut chart: artisanal governorate share for 2026."""
+    name_col = "NameAr" if lang == "ar" else "NameEn"
+    df = df_gov[df_gov["FiscalYear"] == 2026].sort_values("SortOrder")
+
+    fig = go.Figure(go.Pie(
+        labels=df[name_col].tolist(),
+        values=df["QuantityTons"].tolist(),
+        hole=0.45,
+        marker=dict(colors=GOV_COLORS, line=dict(color="white", width=2)),
+        textinfo="label+percent",
+        textfont=dict(size=10),
+        hovertemplate="%{label}<br>%{value:,.0f} t<br>%{percent}<extra></extra>",
+    ))
+    return _fig_layout(fig, t("chart_gov_donut"), lang, height=380)
+
+
+def chart_top_species(df_species: pd.DataFrame, lang: str) -> go.Figure:
+    """Horizontal bar: top-5 artisanal species by share."""
+    name_col = "SpeciesNameAr" if lang == "ar" else "SpeciesNameEn"
+    df = df_species.sort_values("SharePct")
+
+    fig = go.Figure(go.Bar(
+        x=(df["SharePct"] * 100).values,
+        y=df[name_col].tolist(),
+        orientation="h",
+        marker_color=C_BLUE,
+        text=[f"{v*100:.1f}%" for v in df["SharePct"].values],
+        textposition="outside",
+    ))
+    fig.update_layout(xaxis_title=t("axis_share_pct"))
+    return _fig_layout(fig, t("chart_top_species"), lang, height=320)
+
+
+def chart_aqua_species(df_aqua: pd.DataFrame, lang: str) -> go.Figure:
+    """Bar chart: aquaculture species — quantity and value."""
+    name_col = "SpeciesNameAr" if lang == "ar" else "SpeciesNameEn"
+    df = df_aqua[df_aqua["QuantityTons"] > 0].sort_values("QuantityTons", ascending=False)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name=t("lbl_quantity") + " (t)",
+        x=df[name_col].tolist(),
+        y=df["QuantityTons"].values,
+        marker_color=C_TEAL,
+        yaxis="y",
+    ))
+    fig.add_trace(go.Bar(
+        name=t("lbl_value") + " (k OMR)",
+        x=df[name_col].tolist(),
+        y=df["ValueThousandOMR"].values,
+        marker_color=C_GREEN,
+        yaxis="y2",
+    ))
+    fig.update_layout(
+        barmode="group",
+        yaxis=dict(title=t("axis_qty_tons")),
+        yaxis2=dict(title=t("axis_val_komr"), overlaying="y", side="right"),
+    )
+    return _fig_layout(fig, t("chart_aqua_species"), lang, height=380)
+
+
+def chart_vessels(df_vessels: pd.DataFrame, lang: str, top_n: int = 15) -> go.Figure:
+    """Horizontal bar: top-N vessels by production."""
+    df = df_vessels.dropna(subset=["ProductionTons"]).nlargest(top_n, "ProductionTons")
+    df = df.sort_values("ProductionTons")  # ascending for horizontal bar readability
+
+    fig = go.Figure(go.Bar(
+        x=df["ProductionTons"].values,
+        y=df["VesselName"].tolist(),
+        orientation="h",
+        marker=dict(
+            color=df["ProductionTons"].values,
+            colorscale=[[0, C_LBLUE], [1, C_NAVY]],
+            showscale=False,
+        ),
+        text=[f"{v:,.1f}" for v in df["ProductionTons"].values],
+        textposition="outside",
+    ))
+    fig.update_layout(xaxis_title=t("lbl_production"))
+    return _fig_layout(fig, t("chart_vessels"), lang, height=480)
+
+
+# --------------------------------------------------------------------------- #
+# 6. SIDEBAR                                                                   #
+# --------------------------------------------------------------------------- #
+
+def render_sidebar() -> str:
+    """Render sidebar controls.  Returns selected language code ('en' or 'ar')."""
+    with st.sidebar:
+        st.markdown(f"### {t('sidebar_title')}")
+        st.divider()
+
+        # Language toggle
+        lang_choice = st.radio(
+            t("language_label"),
+            options=["English", "العربية"],
+            index=0 if st.session_state.get("lang", "en") == "en" else 1,
+            horizontal=True,
+            key="lang_radio",
+        )
+        lang = "ar" if lang_choice == "العربية" else "en"
+        st.session_state["lang"] = lang
+
+        st.divider()
+        st.caption(f"📁 {t('db_path_label')}")
+        st.code(os.path.basename(DB_PATH), language=None)
+
+        st.caption(f"🔄 {t('data_refresh')}")
+
+        st.divider()
+        st.caption(t("data_source"))
+        st.caption(t("currency_note"))
+
+    return lang
+
+
+# --------------------------------------------------------------------------- #
+# 7. MAIN DASHBOARD                                                            #
+# --------------------------------------------------------------------------- #
+
+def main():
+    # --- Page configuration -------------------------------------------------
+    st.set_page_config(
+        page_title="Fisheries Dashboard | لوحة القطاع السمكي",
+        page_icon="🐠",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    # Default language
+    if "lang" not in st.session_state:
+        st.session_state["lang"] = "en"
+
+    # Render sidebar first (sets session_state lang)
+    lang = render_sidebar()
+
+    # Inject language-aware CSS
+    inject_css(lang)
+
+    # --- Database connectivity check ----------------------------------------
+    try:
+        conn_test = _get_connection()
+        conn_test.close()
+    except Exception as e:
+        st.error(f"⚠️  {t('error_db')}\n\n`{e}`")
+        st.info(f"DB_PATH = `{DB_PATH}`")
+        st.stop()
+
+    # --- Load all data ------------------------------------------------------
+    with st.spinner(""):
+        meta         = load_report_meta()
+        df_sector    = load_sector_summary()
+        df_gov       = load_gov_summary()
+        df_overall   = load_overall_monthly()
+        df_monthly   = load_monthly_production()
+        df_gov_mo    = load_gov_monthly()
+        df_aqua      = load_aqua_species()
+        df_top_sp    = load_top_species()
+        df_vessels   = load_vessels()
+
+    # --- Report header ------------------------------------------------------
+    title_key = "ReportTitleAr" if lang == "ar" else "ReportTitleEn"
+    period_key = "PeriodLabelAr" if lang == "ar" else "PeriodLabelEn"
+    report_title  = meta.get(title_key, t("page_title"))
+    period_label  = meta.get(period_key, t("quarter_badge"))
+
+    st.markdown(
+        f'<div class="report-header">'
+        f'<h1>{report_title}</h1>'
+        f'<p>{period_label}</p>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ======================================================================= #
+    #  SECTION A — KPI CARDS                                                  #
+    # ======================================================================= #
+    # Source totals (2026):
+    #   Total qty  = 259,264 t  → 259.3 k tons (▼3%)
+    #   Total val  = 167,046 k OMR → 167.0 M OMR (▼9%)
+    #   Artisanal share = 198,471 / 259,264 = 76.6%
+    #   Aquaculture qty growth = +40%
+    # These are derived from the loaded data to stay live.
+    # ----------------------------------------------------------------------- #
+
+    # Compute live KPIs from loaded DataFrames
+    sec_2026 = df_sector[df_sector["FiscalYear"] == 2026]
+    sec_2025 = df_sector[df_sector["FiscalYear"] == 2025]
+
+    total_qty_2026 = sec_2026["QuantityTons"].sum()
+    total_qty_2025 = sec_2025["QuantityTons"].sum()
+    total_val_2026 = sec_2026["ValueThousandOMR"].sum()
+    total_val_2025 = sec_2025["ValueThousandOMR"].sum()
+
+    artisanal_share = (
+        sec_2026.loc[sec_2026["SectorCode"] == "ARTISANAL", "QuantityTons"].sum()
+        / total_qty_2026
+        if total_qty_2026 > 0 else 0
+    )
+    aqua_row = sec_2026[sec_2026["SectorCode"] == "AQUACULTURE"]
+    aqua_growth = aqua_row["QtyGrowthPct"].values[0] if not aqua_row.empty else None
+
+    qty_growth  = (total_qty_2026 - total_qty_2025) / total_qty_2025 if total_qty_2025 else None
+    val_growth  = (total_val_2026 - total_val_2025) / total_val_2025 if total_val_2025 else None
+
+    kpi_cols = st.columns(4, gap="medium")
+
+    with kpi_cols[0]:
+        st.metric(
+            label=t("kpi_total_qty"),
+            value=f"{total_qty_2026 / 1000:,.1f} {t('unit_k_tons')}",
+            delta=fmt_pct(qty_growth) + f" {t('vs_2025')}",
+            delta_color="inverse",   # red when negative (production fell)
+        )
+
+    with kpi_cols[1]:
+        st.metric(
+            label=t("kpi_total_val"),
+            value=f"{total_val_2026 / 1000:,.1f} {t('unit_m_omr')}",
+            delta=fmt_pct(val_growth) + f" {t('vs_2025')}",
+            delta_color="inverse",
+        )
+
+    with kpi_cols[2]:
+        st.metric(
+            label=t("kpi_artisanal_share"),
+            value=f"{artisanal_share * 100:.1f} {t('unit_pct')}",
+            delta=None,
+        )
+
+    with kpi_cols[3]:
+        st.metric(
+            label=t("kpi_aqua_growth"),
+            value=fmt_pct(aqua_growth),
+            delta=None,
+        )
+
+    # ======================================================================= #
+    #  SECTION B — MONTHLY OVERVIEW                                           #
+    # ======================================================================= #
+    section_header(t("sec_overview"))
+
+    st.plotly_chart(
+        chart_overall_monthly(df_overall, lang),
+        width="stretch",
+    )
+
+    # ======================================================================= #
+    #  SECTION C — SECTOR BREAKDOWN                                           #
+    # ======================================================================= #
+    section_header(t("sec_sectors"))
+
+    col_left, col_right = st.columns([1.1, 1], gap="large")
+
+    with col_left:
+        # Year toggle for the donut chart
+        donut_year = st.selectbox(
+            label=t("lbl_2026"),
+            options=[2026, 2025],
+            index=0,
+            label_visibility="collapsed",
+        )
+        st.plotly_chart(
+            chart_sector_donut(df_sector, lang, year=donut_year),
+            width="stretch",
+        )
+
+    with col_right:
+        st.plotly_chart(
+            chart_sector_bar(df_sector, lang),
+            width="stretch",
+        )
+
+    # Sector summary table
+    name_col = "NameAr" if lang == "ar" else "NameEn"
+    sec_table = df_sector[df_sector["FiscalYear"] == 2026][[
+        name_col, "QuantityTons", "ValueThousandOMR", "QtyGrowthPct", "ValueGrowthPct"
+    ]].copy()
+    sec_table.columns = [
+        t("lbl_sector"),
+        t("lbl_quantity") + " (t)",
+        t("lbl_value") + " (k OMR)",
+        t("lbl_growth") + " (Qty)",
+        t("lbl_growth") + " (Val)",
+    ]
+    sec_table[t("lbl_growth") + " (Qty)"] = sec_table[t("lbl_growth") + " (Qty)"].apply(fmt_pct)
+    sec_table[t("lbl_growth") + " (Val)"] = sec_table[t("lbl_growth") + " (Val)"].apply(fmt_pct)
+    st.dataframe(sec_table.set_index(t("lbl_sector")), width="stretch")
+
+    # ======================================================================= #
+    #  SECTION D — ARTISANAL FISHING                                          #
+    # ======================================================================= #
+    section_header(t("sec_artisanal"))
+
+    st.plotly_chart(chart_gov_bar(df_gov, lang), width="stretch")
+
+    col_d1, col_d2 = st.columns(2, gap="large")
+    with col_d1:
+        st.plotly_chart(chart_gov_donut(df_gov, lang), width="stretch")
+    with col_d2:
+        st.plotly_chart(chart_top_species(df_top_sp, lang), width="stretch")
+
+    # ======================================================================= #
+    #  SECTION E — AQUACULTURE                                                #
+    # ======================================================================= #
+    section_header(t("sec_aquaculture"))
+
+    col_e1, col_e2 = st.columns([2, 1], gap="large")
+    with col_e1:
+        st.plotly_chart(chart_aqua_species(df_aqua, lang), width="stretch")
+    with col_e2:
+        # Species detail table
+        sp_name_col = "SpeciesNameAr" if lang == "ar" else "SpeciesNameEn"
+        sp_table = df_aqua[[sp_name_col, "QuantityTons", "ValueThousandOMR"]].copy()
+        sp_table.columns = [t("lbl_species"), t("lbl_quantity") + " (t)", t("lbl_value") + " (k OMR)"]
+        st.dataframe(sp_table.set_index(t("lbl_species")), width="stretch")
+
+    # ======================================================================= #
+    #  SECTION F — COMMERCIAL FISHING                                         #
+    # ======================================================================= #
+    section_header(t("sec_commercial"))
+
+    st.plotly_chart(chart_vessels(df_vessels, lang, top_n=15), width="stretch")
+
+    # Full vessels table in expander
+    with st.expander(t("chart_vessels_full")):
+        v_table = df_vessels[["VesselName", "ProductionTons"]].copy()
+        v_table.columns = [t("lbl_vessel"), t("lbl_production")]
+        st.dataframe(v_table, width="stretch")
+
+    # ======================================================================= #
+    #  SECTION G — RAW DATA EXPANDERS                                         #
+    # ======================================================================= #
+    section_header(t("sec_raw"))
+
+    # Monthly quantity pivot (sector totals by month)
+    with st.expander(t("exp_monthly_qty")):
+        if not df_monthly.empty:
+            nm = "NameAr" if lang == "ar" else "NameEn"
+            pivot_qty = df_monthly[df_monthly["FiscalYear"] == 2026].pivot_table(
+                index=nm, columns="MonthNo", values="QuantityTons", aggfunc="sum"
+            )
+            pivot_qty.columns = [month_label(m) for m in pivot_qty.columns]
+            pivot_qty.index.name = t("lbl_sector")
+            pivot_qty["Q1 Total"] = pivot_qty.sum(axis=1)
+            st.dataframe(pivot_qty.style.format("{:,.0f}"), width="stretch")
+
+    # Monthly value pivot
+    with st.expander(t("exp_monthly_val")):
+        if not df_monthly.empty:
+            nm = "NameAr" if lang == "ar" else "NameEn"
+            pivot_val = df_monthly[df_monthly["FiscalYear"] == 2026].pivot_table(
+                index=nm, columns="MonthNo", values="ValueThousandOMR", aggfunc="sum"
+            )
+            pivot_val.columns = [month_label(m) for m in pivot_val.columns]
+            pivot_val.index.name = t("lbl_sector")
+            pivot_val["Q1 Total"] = pivot_val.sum(axis=1)
+            st.dataframe(pivot_val.style.format("{:,.0f}"), width="stretch")
+
+    # Artisanal governorate monthly quantity pivot
+    with st.expander(t("exp_gov_qty")):
+        if not df_gov_mo.empty:
+            nm = "NameAr" if lang == "ar" else "NameEn"
+            pivot_gov = df_gov_mo[df_gov_mo["FiscalYear"] == 2026].pivot_table(
+                index=nm, columns="MonthNo", values="QuantityTons", aggfunc="sum"
+            )
+            pivot_gov.columns = [month_label(m) for m in pivot_gov.columns]
+            pivot_gov.index.name = t("lbl_governorate")
+            pivot_gov["Q1 Total"] = pivot_gov.sum(axis=1)
+            st.dataframe(pivot_gov.style.format("{:,.0f}"), width="stretch")
+
+    # Full vessels table
+    with st.expander(t("exp_vessels")):
+        v_full = df_vessels[["VesselName", "ProductionTons"]].copy()
+        v_full.columns = [t("lbl_vessel"), t("lbl_production")]
+        st.dataframe(v_full, width="stretch")
+
+    # --- Footer ------------------------------------------------------------
+    st.markdown(
+        f'<p class="source-note">{t("data_source")} &nbsp;|&nbsp; {t("currency_note")}</p>',
+        unsafe_allow_html=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# ENTRY POINT                                                                  #
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    main()

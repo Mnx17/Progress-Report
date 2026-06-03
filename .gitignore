@@ -1,0 +1,46 @@
+# ── Database (Windows-only binary, not for version control) ──────────────────
+*.accdb
+*.mdb
+*.laccdb
+
+# ── Source presentation (large binary) ───────────────────────────────────────
+*.pptx
+*.ppt
+
+# ── Streamlit secrets (contain credentials / paths) ──────────────────────────
+.streamlit/secrets.toml
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Environment / dotenv ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── Claude Code internals ─────────────────────────────────────────────────────
+.claude/settings.local.json
+.claude/plans/
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log

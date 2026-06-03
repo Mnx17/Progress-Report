@@ -1,0 +1,21 @@
+# .streamlit/config.toml
+# On-premise server configuration for the Fisheries Dashboard.
+# Security: bind to internal interface only (change to 0.0.0.0 only inside Docker/VPN).
+
+[server]
+headless        = true          # suppress the browser-open prompt
+address         = "127.0.0.1"  # SECURITY: bind to localhost; use reverse proxy for LAN access
+port            = 8501
+enableCORS      = false         # disable if behind a reverse proxy that sets CORS headers
+enableXsrfProtection = true     # protect against cross-site request forgery
+
+[browser]
+gatherUsageStats = false        # no telemetry
+
+[theme]
+base            = "light"
+primaryColor    = "#003366"     # navy — matches dashboard brand colour
+backgroundColor = "#F8FBFF"
+secondaryBackgroundColor = "#EAF3FF"
+textColor       = "#1A2A3A"
+font            = "sans serif"

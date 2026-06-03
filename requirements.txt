@@ -1,0 +1,10 @@
+streamlit>=1.35.0
+pandas>=2.1.0
+pyodbc>=5.0.1
+plotly>=5.20.0
+python-dotenv>=1.0.0
+# pywin32 is required ONLY on Windows for build_db.py (creating the .accdb file).
+# It must be installed separately on the Windows host:
+#   pip install pywin32
+# It is intentionally excluded here so this requirements.txt is also usable
+# inside the Linux Docker image (which does not run build_db.py).
